@@ -1,5 +1,7 @@
 # Prism — Structured Product Pricing & Decomposition Engine
 
+[![CI](https://github.com/ysangj/prism/actions/workflows/ci.yml/badge.svg)](https://github.com/ysangj/prism/actions/workflows/ci.yml)
+
 Prism decomposes a structured financial product (autocallables, reverse convertibles, and more) into its bond floor and embedded option(s), prices each independently from public market data, and reports the issuer's embedded margin — the gap between the offer price and fair value. It's an open, transparent alternative to institutional tools like Bloomberg OVAS.
 
 > **Status: Phase 2 complete.** Prism now ships the full **Streamlit web app** plus the importable pricing library, covering all **five product types** — Autocallable, Reverse Convertible, Principal-Protected Note, Barrier (Digital) Note, and Buffered (Accelerated) Note — and BYOK Claude-powered PDF term-sheet extraction. See [`PRD.md`](PRD.md) §13 for the roadmap (Phase 3: PDF report export, methodology docs, deployment).
