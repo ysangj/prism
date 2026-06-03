@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 100" width="320" height="100" role="img" aria-label="Prism logo">
+  <defs>
+    <linearGradient id="plTL" x1="50" y1="50" x2="14" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="plTR" x1="50" y1="50" x2="86" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="plBR" x1="50" y1="50" x2="78" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#d946ef"/>
+    </linearGradient>
+    <linearGradient id="plBL" x1="50" y1="50" x2="22" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ec4899"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <radialGradient id="plSpark" cx="50" cy="50" r="14" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Mark (same construction as prism_mark.svg) -->
+  <g>
+    <path d="M50 6 L50 50 L8 50 Z" fill="url(#plTL)"/>
+    <path d="M50 6 L92 50 L50 50 Z" fill="url(#plTR)"/>
+    <path d="M50 50 L92 50 L50 94 Z" fill="url(#plBR)"/>
+    <path d="M50 50 L50 94 L8 50 Z" fill="url(#plBL)"/>
+    <g stroke="#0b0420" stroke-opacity="0.18" stroke-width="1" stroke-linejoin="round" fill="none">
+      <path d="M50 6 L50 94 M8 50 L92 50"/>
+    </g>
+    <path d="M50 6 L92 50 L50 94 L8 50 Z" fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="1.5" stroke-linejoin="round"/>
+    <circle cx="50" cy="50" r="13" fill="url(#plSpark)"/>
+    <path d="M50 36 C51 46 54 49 64 50 C54 51 51 54 50 64 C49 54 46 51 36 50 C46 49 49 46 50 36 Z" fill="#ffffff"/>
+  </g>
+
+  <!-- Wordmark: clean rounded system sans, near-white -->
+  <text x="112" y="64"
+        font-family="'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif"
+        font-size="50" font-weight="600" letter-spacing="0.5"
+        fill="#f8fafc">Prism</text>
+</svg>

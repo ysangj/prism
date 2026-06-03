@@ -16,10 +16,13 @@ spread) can also be supplied explicitly to run fully offline / deterministically
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from . import bond_floor as _bond_floor
 from . import market_data, models, risk, vol_surface
+from ._env import load_local_env
 from .models import (
     Autocallable,
     BarrierNote,
@@ -36,6 +39,7 @@ from .pricing import black_scholes, monte_carlo, payoffs
 __all__ = [
     "price_product",
     "decompose",
+    "load_local_env",
     "Autocallable",
     "ReverseConvertible",
     "PrincipalProtected",
@@ -103,9 +107,15 @@ def _resolve_market_inputs(product, overrides: dict) -> dict:
     Any value present in ``overrides`` short-circuits the corresponding fetch so
     the engine can run offline / deterministically. ``overrides`` may contain:
     ``spot``, ``risk_free``, ``div_yield``, ``credit_spread``, ``flat_vol``,
-    ``treasury_curve``.
+    ``treasury_curve``, ``fred_api_key``.
+
+    ``fred_api_key`` (BYOK) is used only to fetch the live Treasury curve when no
+    explicit ``treasury_curve``/``risk_free`` override is given. It is read here
+    first, else from the ``FRED_API_KEY`` environment variable. The key is never
+    logged, persisted, or echoed in notes/errors.
     """
     notes: list[str] = []
+    low_confidence_curve = False
     t_years = tenor_years(product.maturity)
 
     spot = overrides.get("spot")
@@ -118,7 +128,24 @@ def _resolve_market_inputs(product, overrides: dict) -> dict:
 
     risk_free = overrides.get("risk_free")
     if risk_free is None:
-        curve = overrides.get("treasury_curve") or market_data.get_treasury_curve()
+        curve = overrides.get("treasury_curve")
+        if curve is None:
+            # Resolve the FRED key: explicit override first, then environment.
+            fred_key = overrides.get("fred_api_key") or os.environ.get(
+                "FRED_API_KEY"
+            )
+            if fred_key:
+                # Key present: fetch live; a genuine failure correctly raises.
+                curve = market_data.get_treasury_curve(api_key=fred_key)
+            else:
+                # No key: documented static fallback — never crash live pricing.
+                curve = market_data.static_treasury_curve()
+                low_confidence_curve = True
+                notes.append(
+                    "Treasury curve: no FRED key provided — using a static "
+                    f"fallback curve (as-of {market_data.STATIC_CURVE_AS_OF}); "
+                    "rates are LOW CONFIDENCE."
+                )
         risk_free = _interp_rate(curve, t_years)
 
     credit_spread = overrides.get("credit_spread")
@@ -149,6 +176,7 @@ def _resolve_market_inputs(product, overrides: dict) -> dict:
         "credit_spread": credit_spread,
         "surface": surface,
         "maturity_years": t_years,
+        "low_confidence_curve": low_confidence_curve,
         "notes": notes,
     }
 
@@ -333,12 +361,21 @@ def price_product(
         use common random numbers.
     market_overrides : optional explicit market inputs to run offline:
         ``spot``, ``risk_free``, ``div_yield``, ``credit_spread``, ``flat_vol``,
-        ``treasury_curve``.
+        ``treasury_curve``, ``fred_api_key``.
+
+        ``fred_api_key`` (BYOK) is forwarded to
+        ``market_data.get_treasury_curve(api_key=...)`` only when no
+        ``treasury_curve``/``risk_free`` override is supplied. With no key and no
+        curve override, pricing uses the documented static fallback curve, sets
+        ``low_confidence_curve=True`` on the result, and adds a note — it never
+        crashes merely because ``FRED_API_KEY`` is unset. The key is never logged.
 
     Raises
     ------
     market_data.MarketDataError if a required market input cannot be fetched and
-    is not supplied via ``market_overrides``.
+    is not supplied via ``market_overrides``. (A missing FRED key is not such a
+    case — it degrades to the static curve. A FRED fetch failure *with* a key
+    supplied does raise.)
     """
     if not isinstance(product, _SUPPORTED_TYPES):
         raise TypeError(
@@ -354,6 +391,7 @@ def price_product(
     div_yield = mkt["div_yield"]
     credit_spread = mkt["credit_spread"]
     t_years = mkt["maturity_years"]
+    low_confidence_curve = mkt["low_confidence_curve"]
     notes = list(mkt["notes"])
 
     # Use a concrete seed for internal consistency between the base price and the
@@ -422,6 +460,7 @@ def price_product(
         div_yield=div_yield,
         atm_vol=atm_vol,
         low_confidence_vol=surface.low_confidence,
+        low_confidence_curve=low_confidence_curve,
         notes=notes,
     )
 

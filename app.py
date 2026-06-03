@@ -14,13 +14,29 @@ See UI_NOTES.md for the full layout and backend contract mapping.
 """
 from __future__ import annotations
 
+import base64
 import datetime
+import hashlib
+import os
 
 import streamlit as st
 
+import prism
 from prism import price_product
 from prism.market_data import MarketDataError
-from prism.pdf_parser import PdfParseError, parse_term_sheet
+
+# RCA-002 §7C / §A: autoload a local `.env` ONCE at startup, before any env var
+# is read, so FRED_API_KEY (and optionally the Anthropic key) can live there.
+# Safe no-op if python-dotenv / .env is absent; never raises (BACKEND_NOTES.md).
+# `override=False` upstream means already-exported env vars win over .env.
+if not st.session_state.get("_env_loaded"):
+    prism.load_local_env()
+    st.session_state["_env_loaded"] = True
+from prism.pdf_parser import (
+    PdfParseError,
+    UnsupportedProductError,
+    parse_term_sheet,
+)
 
 from prism_ui import charts
 from prism_ui.config import (
@@ -56,21 +72,83 @@ DEMO_SEED = 7
 DEFAULT_PRODUCT_TYPE = "autocallable"
 
 
+# ----------------------------------------------------------------------------
+# Branding assets (hand-authored SVG; see assets/ and UI_NOTES.md)
+# ----------------------------------------------------------------------------
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_LOGO_SVG_PATH = os.path.join(_ASSETS_DIR, "prism_logo.svg")
+_FAVICON_PNG_PATH = os.path.join(_ASSETS_DIR, "prism_favicon.png")
+
+
+@st.cache_resource(show_spinner=False)
+def _logo_data_uri() -> str | None:
+    """Return the full Prism lockup SVG as a base64 `data:` URI.
+
+    Streamlit sanitizes raw inline SVG in `st.markdown`, so we embed the SVG as
+    a base64 data URI inside an <img>, which renders reliably and stays crisp at
+    any size. Returns None if the asset is missing (header then falls back to a
+    plain text title) so a missing file can never crash the app.
+    """
+    try:
+        with open(_LOGO_SVG_PATH, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        return f"data:image/svg+xml;base64,{b64}"
+    except OSError:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _favicon():
+    """Page icon: the custom Prism mark.
+
+    Prefer the PNG mark (rendered from assets/prism_mark.svg) loaded via PIL —
+    the most reliable page_icon input. Falls back to the prism emoji if the
+    asset can't be loaded, so set_page_config never fails.
+    """
+    try:
+        from PIL import Image
+        return Image.open(_FAVICON_PNG_PATH)
+    except Exception:
+        return "🔷"
+
+
 st.set_page_config(page_title="Prism — Structured Product Decomposition",
-                   page_icon="🔷", layout="wide")
+                   page_icon=_favicon(), layout="wide")
 
 
 # ----------------------------------------------------------------------------
 # Cached pricing wrapper (PRD §15.6 — don't re-hit APIs on every rerun)
 # ----------------------------------------------------------------------------
+def _fred_key_token(fred_api_key: str | None) -> str:
+    """Stable, non-reversible cache token for the FRED key (RCA-002 §7B.3).
+
+    The cache key must change when the key's *presence* changes (so toggling a
+    key on/off re-runs pricing) WITHOUT ever placing the raw secret into the
+    cache key — Streamlit may surface/persist cache keys, and the key must never
+    be logged. We use a short SHA-256 prefix so two distinct keys also map to
+    distinct cache slots, but the digest can't be reversed back to the secret.
+    Empty/None -> a fixed "nokey" sentinel (the static-fallback slot).
+    """
+    if not fred_api_key:
+        return "nokey"
+    return "k:" + hashlib.sha256(fred_api_key.encode("utf-8")).hexdigest()[:16]
+
+
 @st.cache_data(show_spinner=False)
 def _price_cached(product_type: str, shared_key: tuple, per_type_key: tuple,
-                  demo_mode: bool, n_paths: int):
+                  demo_mode: bool, n_paths: int, fred_key_token: str,
+                  _fred_api_key: str | None):
     """Cache keyed on serializable inputs only.
 
     Rebuilds the product dataclass from primitive keys so the cache key is
     hashable and stable. Returns the DecompositionResult (a frozen-ish
     dataclass of primitives + lists, safe to cache).
+
+    `fred_key_token` is the hashed, non-reversible FRED-key token that PARTICIPATES
+    in the cache key (so changing/clearing the key re-runs). `_fred_api_key` is
+    the real secret, forwarded to `price_product` only in live mode; the leading
+    underscore tells `st.cache_data` to EXCLUDE it from the cache key, so the raw
+    key is never hashed/persisted by the cache (RCA-002 §7B.3, PRD §9).
     """
     shared = dict(shared_key)
     # maturity comes through as an ISO string in the key; restore to date.
@@ -81,7 +159,11 @@ def _price_cached(product_type: str, shared_key: tuple, per_type_key: tuple,
     if demo_mode:
         return price_product(product, n_paths=n_paths, seed=DEMO_SEED,
                              **DEMO_MARKET)
-    return price_product(product, n_paths=n_paths)
+    # Live mode: forward the FRED key (used only when no treasury_curve/risk_free
+    # override is given). None -> backend uses FRED_API_KEY env, else static
+    # fallback flagged low_confidence_curve (BACKEND_NOTES.md).
+    return price_product(product, n_paths=n_paths,
+                         fred_api_key=(_fred_api_key or None))
 
 
 # ----------------------------------------------------------------------------
@@ -90,9 +172,24 @@ def _price_cached(product_type: str, shared_key: tuple, per_type_key: tuple,
 def _init_state():
     ss = st.session_state
     ss.setdefault("anthropic_key", "")
+    # RCA-002 §7B: BYOK FRED key — session-state only, distinct from the
+    # Anthropic key. Pre-seed from the environment (incl. anything loaded from
+    # .env) so a key set there is honored without forcing a retype; the sidebar
+    # field can still override it.
+    ss.setdefault("fred_key", (os.environ.get("FRED_API_KEY") or "").strip())
     ss.setdefault("product_type", DEFAULT_PRODUCT_TYPE)
     ss.setdefault("result", None)
     ss.setdefault("priced_meta", None)
+    # Refusal surface (RCA §7C): set when a PDF upload is out-of-scope.
+    #   None        -> no active refusal
+    #   list[str]   -> reasons to render; while set, Analyze is disabled so the
+    #                  user can't price the (intentionally un-prefilled) form.
+    ss.setdefault("refusal_reasons", None)
+    # Inferred / low-confidence fields from the most recent successful parse
+    # (RCA §D / §7C.5). Cleared when the user edits the form.
+    ss.setdefault("inferred_fields", [])
+    # Identity of the last extracted upload, so a *new* file clears stale state.
+    ss.setdefault("last_upload_id", None)
     # Seed form-field defaults so widgets can be driven purely by `key=`
     # (avoids Streamlit's "both value= and key=" warning, and lets PDF parsing
     # populate fields by writing session_state before the widgets render).
@@ -151,6 +248,19 @@ def _apply_parsed_fields(parsed: dict):
         if key in parsed and parsed[key] is not None:
             ss[_pt_key(ptype, key)] = parsed_value_to_human(key, parsed[key])
 
+    # Low-confidence inferred fields (RCA §7C.5) — surface as a caption later.
+    ss["inferred_fields"] = list(parsed.get("inferred_fields") or [])
+
+
+def _clear_refusal():
+    """Drop any active refusal so manual pricing / a fresh parse can proceed.
+
+    Called whenever the user signals a new intent: changing the product type,
+    editing the form, or extracting a different PDF. This guarantees the
+    refusal flag never *permanently* blocks legitimate single-name manual entry.
+    """
+    st.session_state["refusal_reasons"] = None
+
 
 # ============================================================================
 # SIDEBAR — Settings (BYOK), demo toggle, PDF upload
@@ -190,6 +300,28 @@ with st.sidebar:
     has_key = bool(st.session_state["anthropic_key"])
 
     st.divider()
+    st.subheader("🔑 FRED API key (optional)")
+    st.caption(
+        "Used only for the **live U.S. Treasury yield curve** (live market mode, "
+        "demo OFF). Without it, Prism uses a documented static fallback curve and "
+        "flags the result **low confidence**. Stored in this session's memory "
+        "only — never written to disk or logged (PRD §9). Can also live in a "
+        "local `.env` as `FRED_API_KEY`."
+    )
+    fred_input = st.text_input(
+        "FRED API key",
+        value=st.session_state["fred_key"],
+        type="password",
+        placeholder="FRED API key (optional)",
+        label_visibility="collapsed",
+    )
+    # Sidebar field overrides the env/.env-seeded value, but a blank field falls
+    # back to whatever the environment provides (so a .env key still works even
+    # if the user never types into the box).
+    st.session_state["fred_key"] = fred_input.strip()
+    fred_key = st.session_state["fred_key"] or (os.environ.get("FRED_API_KEY") or "").strip()
+
+    st.divider()
     st.subheader("📄 Upload term sheet (PDF)")
     if not has_key:
         st.caption("🔒 Enter your Anthropic API key above to enable PDF upload "
@@ -205,25 +337,54 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     if uploaded is not None and has_key:
+        # A *new* upload supersedes any prior refusal/extract state.
+        upload_id = (uploaded.name, uploaded.size)
+        if upload_id != st.session_state["last_upload_id"]:
+            _clear_refusal()
+            st.session_state["last_upload_id"] = upload_id
         if st.button("Extract fields from PDF", width='stretch'):
             with st.spinner("Parsing term sheet with Claude…"):
                 try:
                     parsed = parse_term_sheet(uploaded.getvalue(),
                                               st.session_state["anthropic_key"])
-                    _apply_parsed_fields(parsed)
-                    st.success("Fields extracted. Review/edit below, then click "
-                               "Analyze.")
+                # NOTE: UnsupportedProductError subclasses PdfParseError, so it
+                # MUST be caught FIRST (BACKEND_NOTES.md) or the generic handler
+                # below would swallow the refusal.
+                except UnsupportedProductError as exc:
+                    # Refuse: do NOT pre-fill the form (no lossy single-name
+                    # approximation). Raise the flag so Analyze is disabled and
+                    # render the refusal panel in the main area below.
+                    st.session_state["refusal_reasons"] = list(exc.reasons)
+                    st.session_state["inferred_fields"] = []
                     st.rerun()
                 except PdfParseError as exc:
                     st.error(str(exc))
                 except Exception as exc:  # defensive: never leak a traceback
                     st.error(f"Could not parse the PDF: {exc}")
+                else:
+                    _clear_refusal()
+                    _apply_parsed_fields(parsed)
+                    st.success("Fields extracted. Review/edit below, then click "
+                               "Analyze.")
+                    st.rerun()
 
 
 # ============================================================================
 # HEADER
 # ============================================================================
-st.title("🔷 Prism")
+_logo_uri = _logo_data_uri()
+if _logo_uri:
+    # Branded lockup (mark + wordmark). base64 data-URI <img> renders reliably
+    # in Streamlit markdown and stays crisp (SVG). height ~44px reads well in the
+    # header and on the dark background; width auto-scales to preserve aspect.
+    st.markdown(
+        f'<img src="{_logo_uri}" alt="Prism" '
+        'style="height:44px;width:auto;display:block;margin:0.1rem 0 0.25rem;" />',
+        unsafe_allow_html=True,
+    )
+else:
+    # Asset missing — keep a working text title rather than a broken image.
+    st.title("🔷 Prism")
 st.caption("Independent structured-product pricing & decomposition. "
            "Educational / research tool — not investment advice.")
 if demo_mode:
@@ -246,7 +407,40 @@ selected_label = st.selectbox(
 )
 # Map label back to key.
 product_type = type_keys[[PRODUCT_LABELS[k] for k in type_keys].index(selected_label)]
+# Changing the product type is an explicit "I'm entering this myself" signal:
+# clear any active refusal (so manual pricing works) and drop stale inferred
+# flags carried over from a parse of a different product.
+if product_type != st.session_state["product_type"]:
+    _clear_refusal()
+    st.session_state["inferred_fields"] = []
 st.session_state["product_type"] = product_type
+
+# ----------------------------------------------------------------------------
+# Refusal panel (RCA §7C) — shown when the last upload was out-of-scope.
+# Pricing is intentionally blocked: the form was NOT pre-filled, and the
+# Analyze button is disabled while this flag is set (see `refused` below).
+# ----------------------------------------------------------------------------
+refusal_reasons = st.session_state.get("refusal_reasons")
+refused = bool(refusal_reasons)
+if refused:
+    st.error("🚫 **Prism can't independently value this note:**", icon="🚫")
+    st.markdown("\n".join(f"- {r}" for r in refusal_reasons))
+    st.info(
+        "We don't show a fair value here on purpose — approximating a "
+        "multi-underlier or geared note as a single-name product would give a "
+        "silently-wrong number. **You can still value a single-underlier note** "
+        "by entering its parameters manually in the form below (pick the product "
+        "type and fill in the fields), then click Analyze.",
+        icon="✍️",
+    )
+    if st.button("Dismiss and enter a note manually",
+                 help="Clears this notice and re-enables Analyze so you can "
+                      "price a single-underlier note from the form below."):
+        _clear_refusal()
+        st.session_state["last_upload_id"] = None
+        st.rerun()
+    st.caption("Changing the product type or uploading a different term sheet "
+               "also clears this notice.")
 
 with st.form("term_sheet_form"):
     c1, c2, c3 = st.columns(3)
@@ -301,8 +495,20 @@ with st.form("term_sheet_form"):
                     label, min_value=0.0, max_value=200.0, step=0.5, format="%.2f",
                     key=skey, help=help_txt)
 
-    submitted = st.form_submit_button("🔍 Analyze", type="primary",
-                                      width='stretch')
+    # Low-confidence inferred fields (RCA §7C.5): surface, don't block.
+    inferred = st.session_state.get("inferred_fields") or []
+    if inferred and not refused:
+        st.warning(
+            "⚠️ **Inferred (please verify):** " + ", ".join(inferred) +
+            " — these were defaulted/approximated from the term sheet rather "
+            "than read verbatim. Double-check them before pricing.")
+
+    # While a refusal is active, disable Analyze so the (un-prefilled) form
+    # can't be used to price the dropped basket/geared note. The flag clears
+    # the moment the user changes the product type, edits the form, or uploads
+    # a different PDF — manual single-name entry is never permanently blocked.
+    submitted = st.form_submit_button(
+        "🔍 Analyze", type="primary", width='stretch', disabled=refused)
 
 
 # ----------------------------------------------------------------------------
@@ -346,10 +552,16 @@ if submitted:
         # Build hashable cache keys (sorted tuples of primitives).
         shared_key = tuple(sorted({**shared, "maturity": maturity.isoformat()}.items()))
         per_type_key = tuple(sorted(per_type_human.items()))
+        # FRED key (live mode only). The hashed token participates in the cache
+        # key so toggling/changing the key re-runs; the raw secret is passed via
+        # the underscore-prefixed arg, which st.cache_data excludes from the key.
+        live_fred_key = "" if demo_mode else fred_key
+        fred_token = _fred_key_token(live_fred_key)
         try:
             with st.spinner("Pricing… (Monte Carlo, Greeks, payoff curve)"):
                 result = _price_cached(product_type, shared_key, per_type_key,
-                                       demo_mode, int(n_paths))
+                                       demo_mode, int(n_paths),
+                                       fred_token, (live_fred_key or None))
             st.session_state["result"] = result
             st.session_state["priced_meta"] = {
                 "notional": shared["notional"],
@@ -384,6 +596,16 @@ notional = meta["notional"]
 
 st.divider()
 st.subheader("2 · Component decomposition")
+# RCA-002 §7B.4 — inline LOW-CONFIDENCE notice when the static Treasury curve was
+# used (no FRED key in live mode). This is NOT an error: pricing succeeded with a
+# documented fallback curve. Independent of low_confidence_vol; render separately.
+if getattr(result, "low_confidence_curve", False):
+    st.warning(
+        "⚠️ **Low-confidence Treasury curve:** no FRED key was available, so a "
+        "static fallback curve was used — interest-rate inputs are approximate. "
+        "Add a **FRED API key** in the sidebar (or set `FRED_API_KEY`) for the "
+        "live curve.",
+        icon="⚠️")
 if getattr(result, "low_confidence_vol", False):
     st.warning("⚠️ Low-confidence volatility: the options chain was sparse, so a "
                "flat ATM vol was used. Treat the option value as approximate.")

@@ -43,7 +43,12 @@ import re
 
 import anthropic
 
-__all__ = ["parse_term_sheet", "PdfParseError"]
+__all__ = [
+    "parse_term_sheet",
+    "PdfParseError",
+    "UnsupportedProductError",
+    "check_supported",
+]
 
 # Current, cost/speed-efficient model. Internal constant -- change in one place.
 _MODEL = "claude-sonnet-4-6"
@@ -104,12 +109,26 @@ First classify the product into exactly one of these types:
   - "buffered_note"         (leveraged & capped upside with a downside buffer)
 
 Then extract these common fields:
-  - underlier:     primary underlying ticker symbol (e.g. "AAPL", "SPY"); if a basket/worst-of, use the primary or first ticker
+  - underlier:     the underlying ticker symbol (e.g. "AAPL", "SPY"). If the note is linked to a basket / worst-of of several underliers, report the LARGEST-WEIGHT (or first) constituent ticker here ONLY so a refusal message can name it -- DO NOT pretend the note is single-name; the detection fields below are what matter.
   - notional:      denomination / principal amount in dollars (a number, e.g. 100000); use 1000 if the note is sold per $1,000 denomination and no total is given
-  - maturity:      maturity / final valuation date as "YYYY-MM-DD"
+  - final_valuation_date: the final valuation / observation date as "YYYY-MM-DD" (the date the underlier level is last observed); else null
+  - maturity_date: the maturity / principal-repayment / settlement (payment) date as "YYYY-MM-DD" -- this is the date the note pays off, which is usually a few business days AFTER the final valuation date; else null
   - issuer:        issuing entity name
-  - issuer_rating: issuer credit rating if stated (e.g. "A", "Baa1"); else null
+  - issuer_rating: issuer credit rating ONLY if explicitly stated in the document (e.g. "A", "Baa1"); else null. Do not infer a rating.
   - offer_price:   public offering price as a PERCENT of par (e.g. 100 for par); else null
+
+Detection fields (REQUIRED -- these gate whether the product can be priced):
+  - num_underlyings:     integer count of distinct underliers the note references (1 for a single-name note)
+  - is_basket:           true if the note is linked to a basket / index basket / multiple underliers, else false
+  - basket_constituents: list of {"ticker": str, "weight": number} for every underlier in the basket (weight as a fraction or percent as printed); use an empty list [] for a single-name note
+  - unsupported_features: list drawn ONLY from this exact vocabulary, including every one that applies, else an empty list []:
+        "basket"          -- linked to more than one underlier
+        "worst_of"        -- payoff depends on the worst (or best) performing of several underliers
+        "geared_downside" -- downside loss is GEARED/LEVERAGED (e.g. a 1.11x or "buffer rate"/"downside leverage factor" > 1.0), so losses exceed 1:1 below the threshold
+        "airbag"          -- an "airbag" feature / geared buffer that absorbs an initial loss then gears thereafter
+        "range_accrual"   -- coupon accrues based on days the underlier stays in a range
+        "dual_directional"-- pays positive return for BOTH up and down moves (a.k.a. twin-win / absolute return)
+        "snowball"        -- memory / cumulative ("snowball") coupon that rolls up unpaid coupons
 
 And the type-specific fields (PERCENTS as plain numbers, e.g. 9.5 for 9.5%, 70 for 70%):
   autocallable:        coupon_rate, coupon_barrier, call_barrier, knock_in_barrier, observation_freq ("monthly"|"quarterly"|"semiannual"|"annual")
@@ -123,7 +142,8 @@ Rules:
   - Use null for any field you cannot find or are unsure about. DO NOT GUESS or invent values.
   - Percentages as plain numbers (70 not 0.70). upside_leverage as a multiple (1.5).
   - notional and participation/leverage are amounts/multiples, NOT percents.
-  - Always include a "product_type" key.
+  - For the detection fields: report what the document ACTUALLY says. Do not normalize a basket into a single name. unsupported_features must contain ONLY strings from the vocabulary above.
+  - Always include "product_type", "num_underlyings", "is_basket", "basket_constituents", and "unsupported_features" keys.
 
 Return only the JSON object."""
 
@@ -133,6 +153,146 @@ class PdfParseError(RuntimeError):
 
     Carries a user-friendly message. The API key is never included.
     """
+
+
+class UnsupportedProductError(PdfParseError):
+    """Raised when a parsed term sheet describes a product outside Prism's scope.
+
+    Subclasses :class:`PdfParseError` so existing callers that catch
+    ``PdfParseError`` keep working -- but the UI should catch
+    ``UnsupportedProductError`` FIRST to render the dedicated refusal panel.
+
+    Carries the structured list of refusal reasons on ``.reasons``. The API key
+    is NEVER included in the message or the reasons.
+    """
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = list(reasons or [])
+        joined = "; ".join(self.reasons) if self.reasons else "unsupported product"
+        super().__init__(
+            "Prism can't independently value this note: " + joined
+        )
+
+
+# Supported product types -- the single source of truth for the type gate
+# (mirrors prism.__init__._SUPPORTED_TYPES at the dataclass level).
+_SUPPORTED_TYPES = frozenset(_FIELDS_BY_TYPE)
+
+# Allowed barrier monitoring conventions.
+_SUPPORTED_BARRIER_TYPES = frozenset({"european", "american"})
+
+# Controlled vocabulary -> friendly refusal text. Keys MUST match the prompt's
+# ``unsupported_features`` vocabulary exactly.
+_FEATURE_REASONS = {
+    "basket": "Multi-underlier basket — Prism prices single-underlier notes only",
+    "worst_of": "Worst-of / best-of payoff on multiple underliers — not supported",
+    "geared_downside": "Geared/leveraged downside (loss > 1:1) — only 1.0× downside is supported",
+    "airbag": "Airbag / geared-buffer downside — only a plain buffer or knock-in is supported",
+    "range_accrual": "Range-accrual coupon — not supported",
+    "dual_directional": "Dual-directional / twin-win payoff — not supported",
+    "snowball": "Snowball / memory coupon — not supported",
+}
+
+# Bloomberg-style index tickers -> Yahoo Finance symbols (yfinance live mode).
+# Equity single names and already-Yahoo / unknown tickers are left untouched.
+_BLOOMBERG_TO_YAHOO = {
+    "SX5E": "^STOXX50E",
+    "NKY": "^N225",
+    "UKX": "^FTSE",
+    "SMI": "^SSMI",
+    "AS51": "^AXJO",
+    "SPX": "^GSPC",
+    "RTY": "^RUT",
+    "NDX": "^NDX",
+}
+
+
+def _normalize_ticker(ticker):
+    """Map a Bloomberg index ticker to its Yahoo symbol; pass others through.
+
+    Returns the input unchanged for already-Yahoo or unknown tickers (no guessing).
+    """
+    if not isinstance(ticker, str):
+        return ticker
+    return _BLOOMBERG_TO_YAHOO.get(ticker.strip().upper(), ticker.strip())
+
+
+def check_supported(extracted: dict) -> list[str]:
+    """Enforce the §6 support boundary on a raw extracted dict.
+
+    Returns ``[]`` if the product is priceable, otherwise a list of
+    human-readable refusal reasons (every reason that applies).
+
+    Tolerant of missing / None detection fields (older extractions): an absent
+    flag is treated as "not flagged", EXCEPT that a constituent count > 1 always
+    triggers the basket reason.
+
+    The API key is never referenced here.
+    """
+    if not isinstance(extracted, dict):
+        return ["Could not interpret the extracted product data."]
+
+    reasons: list[str] = []
+
+    # --- Basket / multi-underlier detection ---------------------------------
+    num = extracted.get("num_underlyings")
+    is_basket = extracted.get("is_basket")
+    constituents = extracted.get("basket_constituents")
+    n_constituents = len(constituents) if isinstance(constituents, (list, tuple)) else 0
+
+    try:
+        num_int = int(num) if num is not None else None
+    except (TypeError, ValueError):
+        num_int = None
+
+    basket_flagged = bool(is_basket) or (num_int is not None and num_int > 1) or n_constituents > 1
+    if basket_flagged:
+        count = num_int if (num_int is not None and num_int > 1) else max(n_constituents, 2)
+        reasons.append(
+            f"Multi-underlier basket ({count} underlyings) — "
+            "Prism prices single-underlier notes only"
+        )
+
+    # --- Controlled-vocabulary unsupported features -------------------------
+    features = extracted.get("unsupported_features")
+    if isinstance(features, (list, tuple)):
+        seen = set()
+        for feat in features:
+            if not isinstance(feat, str):
+                continue
+            key = feat.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if key == "basket":
+                # Already covered by the basket detection above (avoid dupes).
+                if not basket_flagged:
+                    reasons.append(_FEATURE_REASONS["basket"])
+            elif key in _FEATURE_REASONS:
+                reasons.append(_FEATURE_REASONS[key])
+            else:
+                reasons.append(f"Unsupported feature: {key}")
+
+    # --- Product-type gate --------------------------------------------------
+    ptype = extracted.get("product_type")
+    if isinstance(ptype, str):
+        ptype = ptype.strip().lower()
+    if ptype not in _SUPPORTED_TYPES:
+        reasons.append(
+            f"Unsupported product type: {ptype!r} — supported types are "
+            + ", ".join(sorted(_SUPPORTED_TYPES))
+        )
+
+    # --- Barrier-type gate (only when present) ------------------------------
+    btype = extracted.get("barrier_type")
+    if isinstance(btype, str):
+        btype_norm = btype.strip().lower()
+        if btype_norm and btype_norm not in _SUPPORTED_BARRIER_TYPES:
+            reasons.append(
+                f"Unsupported barrier type: {btype_norm!r} — only european / american"
+            )
+
+    return reasons
 
 
 def _build_request(pdf_bytes: bytes) -> dict:
@@ -249,18 +409,36 @@ def _coerce(raw: dict, product_type: str) -> dict:
     """
     wanted = set(_FIELDS_BY_TYPE.get(product_type, [])) | {"product_type"}
     out: dict = {"product_type": product_type}
+    inferred: list[str] = []
 
     for key in wanted:
         if key == "product_type":
             continue
+
+        # Maturity is sourced from the split date fields, not a raw "maturity"
+        # key. Prefer the true maturity/payment date; fall back to the final
+        # valuation date (and record the ambiguity).
+        if key == "maturity":
+            maturity_raw = raw.get("maturity_date")
+            valuation_raw = raw.get("final_valuation_date")
+            if maturity_raw is None and valuation_raw is None:
+                # Backwards-compat: older extractions used a single "maturity".
+                maturity_raw = raw.get("maturity")
+            chosen = maturity_raw if maturity_raw is not None else valuation_raw
+            if maturity_raw is None and valuation_raw is not None:
+                # Only the valuation date was found -- maturity is approximated.
+                inferred.append("maturity")
+            out[key] = _parse_date(chosen)
+            continue
+
         value = raw.get(key)
 
         if value is None:
             out[key] = None
             continue
 
-        if key == "maturity":
-            out[key] = _parse_date(value)
+        if key == "underlier":
+            out[key] = _normalize_ticker(value)
         elif key == "offer_price":
             out[key] = _scale_offer_price(value)
         elif key == "notional":
@@ -284,6 +462,7 @@ def _coerce(raw: dict, product_type: str) -> dict:
         else:
             out[key] = value
 
+    out["inferred_fields"] = inferred
     return out
 
 
@@ -301,11 +480,21 @@ def parse_term_sheet(pdf_bytes: bytes, api_key: str) -> dict:
     dict
         Keys match the relevant product dataclass's fields plus ``product_type``
         (one of "autocallable", "reverse_convertible", "principal_protected",
-        "barrier_note", "buffered_note"). Percentages are fractions, dates are
-        :class:`datetime.date`, and fields absent from the sheet are ``None``.
+        "barrier_note", "buffered_note") and ``inferred_fields`` (list of field
+        names that were defaulted/approximated rather than read from the sheet).
+        Percentages are fractions, ``maturity`` is a :class:`datetime.date`
+        (the principal-repayment date, falling back to the final valuation date),
+        ``underlier`` is Yahoo-normalized, and fields absent from the sheet are
+        ``None``. The basket/feature detection fields used to gate pricing
+        (``num_underlyings``, ``is_basket``, ``basket_constituents``,
+        ``unsupported_features``) are validated via :func:`check_supported` and
+        are NOT included in the returned (priceable) dict.
 
     Raises
     ------
+    UnsupportedProductError
+        If the product is outside Prism's scope (basket, geared downside, etc.).
+        Subclass of ``PdfParseError`` -- catch it FIRST. Carries ``.reasons``.
     PdfParseError
         On authentication failure, network/API error, or unparseable output.
     """
@@ -356,5 +545,12 @@ def parse_term_sheet(pdf_bytes: bytes, api_key: str) -> dict:
             "Could not determine the product type from the document. Please "
             "select the product type and enter the parameters manually."
         )
+
+    # Refuse out-of-scope products at the parse boundary (§6). This MUST happen
+    # before _coerce / dataclass mapping, which cannot represent basket or
+    # geared-downside features. The raw dict carries the detection fields.
+    reasons = check_supported(raw)
+    if reasons:
+        raise UnsupportedProductError(reasons=reasons)
 
     return _coerce(raw, product_type)

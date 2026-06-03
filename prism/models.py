@@ -237,4 +237,7 @@ class DecompositionResult:
     div_yield: float | None = None
     atm_vol: float | None = None
     low_confidence_vol: bool = False
+    # True when the risk-free curve came from the static fallback (no FRED key);
+    # rates and anything derived from them are LOW CONFIDENCE (RCA PRISM-RCA-002).
+    low_confidence_curve: bool = False
     notes: list = field(default_factory=list)

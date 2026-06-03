@@ -15,9 +15,12 @@ an error.
 Environment
 -----------
 ``FRED_API_KEY`` (optional) enables live Treasury-curve fetches from FRED. If it
-is unset, :func:`get_treasury_curve` raises :class:`MarketDataError`; callers
-that want to proceed offline can pass an explicit curve to the pricing layer.
-yfinance requires no API key.
+is unset, :func:`get_treasury_curve` returns a documented *static fallback*
+Treasury curve (:func:`static_treasury_curve`) instead of raising — callers
+should treat that result as LOW CONFIDENCE. When a key *is* supplied but the
+fetch genuinely fails (bad key, outage, empty result), :class:`MarketDataError`
+is raised so the problem is surfaced rather than masked. yfinance requires no
+API key.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ __all__ = [
     "get_options_chain",
     "get_dividend_yield",
     "get_treasury_curve",
+    "static_treasury_curve",
     "get_credit_spread",
     "clear_cache",
     "RATING_SPREADS",
@@ -236,22 +240,48 @@ _FRED_TREASURY_SERIES = {
     "DGS30": 30.0,
 }
 
+# Static fallback Treasury par yield curve, used when no FRED key is available
+# (RCA PRISM-RCA-002 §6.A). Rates are fractions and cover the same tenors as
+# ``_FRED_TREASURY_SERIES``. Results derived from this curve are LOW CONFIDENCE.
+#
+# Source: U.S. Treasury Daily Par Yield Curve Rates (CMT), as-of 2026-05-29.
+#   https://home.treasury.gov/.../daily-treasury-rates
+# This is a representative, recent par curve; refresh it periodically. It exists
+# only so live pricing degrades gracefully instead of hard-failing without a key.
+STATIC_CURVE_AS_OF = "2026-05-29"
+_STATIC_TREASURY_CURVE = {
+    1 / 12: 0.0432,   # 1-month
+    0.25: 0.0428,     # 3-month
+    0.5: 0.0421,      # 6-month
+    1.0: 0.0405,      # 1-year
+    2.0: 0.0388,      # 2-year
+    3.0: 0.0385,      # 3-year
+    5.0: 0.0392,      # 5-year
+    7.0: 0.0408,      # 7-year
+    10.0: 0.0425,     # 10-year
+    20.0: 0.0462,     # 20-year
+    30.0: 0.0451,     # 30-year
+}
 
-@functools.lru_cache(maxsize=1)
-def get_treasury_curve(api_key: str | None = None) -> dict:
-    """U.S. Treasury par yield curve as ``{tenor_years: rate}`` (rates as fractions).
 
-    Pulls FRED constant-maturity series. Requires a FRED API key, taken from the
-    ``api_key`` argument or the ``FRED_API_KEY`` environment variable. Raises
-    :class:`MarketDataError` if the key is missing or the fetch fails.
+def static_treasury_curve() -> dict:
+    """Return a fresh copy of the documented static fallback Treasury curve.
+
+    ``{tenor_years: rate}`` with rates as fractions. Used when no FRED API key is
+    available; callers must treat derived results as LOW CONFIDENCE. See
+    :data:`STATIC_CURVE_AS_OF` for the as-of date.
     """
-    key = api_key or os.environ.get("FRED_API_KEY")
-    if not key:
-        raise MarketDataError(
-            "FRED_API_KEY is not set; cannot fetch the Treasury curve. "
-            "Set the environment variable or pass api_key=..."
-        )
+    return dict(_STATIC_TREASURY_CURVE)
 
+
+def _fetch_fred_curve(key: str) -> dict:
+    """Fetch the live Treasury curve from FRED. Raises on a genuine failure.
+
+    Separated from the cache wrapper so the no-key static path and the keyed live
+    path never share an ``lru_cache`` slot. Always raises
+    :class:`MarketDataError` when no usable data is returned (so a bad key or
+    outage with a key supplied is surfaced, per RCA §6).
+    """
     try:
         from fredapi import Fred
     except ImportError as exc:  # pragma: no cover
@@ -273,6 +303,29 @@ def get_treasury_curve(api_key: str | None = None) -> dict:
     if not curve:
         raise MarketDataError("FRED returned no Treasury data for any tenor")
     return curve
+
+
+@functools.lru_cache(maxsize=8)
+def get_treasury_curve(api_key: str | None = None) -> dict:
+    """U.S. Treasury par yield curve as ``{tenor_years: rate}`` (rates as fractions).
+
+    Behavior (RCA PRISM-RCA-002 §6.A):
+
+    * **No key** — neither ``api_key`` nor ``FRED_API_KEY`` is set — returns the
+      documented :func:`static_treasury_curve` fallback and does **not** raise.
+      Callers should flag derived results LOW CONFIDENCE.
+    * **Key supplied** (argument or env) — fetches the live FRED curve and raises
+      :class:`MarketDataError` on a genuine fetch failure or empty result, so a
+      bad key / outage is surfaced rather than silently masked.
+
+    The cache keys on ``api_key`` (with a maxsize > 1) so the static no-key path
+    and any keyed live path occupy distinct slots and never collide.
+    """
+    key = api_key or os.environ.get("FRED_API_KEY")
+    if not key:
+        # Documented graceful fallback: a fresh static curve copy.
+        return static_treasury_curve()
+    return _fetch_fred_curve(key)
 
 
 # ---------------------------------------------------------------------------

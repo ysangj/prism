@@ -18,6 +18,7 @@ dependencies = [
     "pandas>=2.2",
     "yfinance>=0.2.40",
     "fredapi>=0.5",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
