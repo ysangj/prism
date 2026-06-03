@@ -21,12 +21,25 @@ should treat that result as LOW CONFIDENCE. When a key *is* supplied but the
 fetch genuinely fails (bad key, outage, empty result), :class:`MarketDataError`
 is raised so the problem is surfaced rather than masked. yfinance requires no
 API key.
+
+Transport (PRISM-RCA-003)
+-------------------------
+Live FRED data is fetched directly from the FRED REST API with :mod:`requests`,
+which verifies TLS against the bundled :mod:`certifi` CA store. This sidesteps
+the macOS python.org cert gap that broke the old ``fredapi``/``urllib`` path
+(``ssl.SSLCertVerificationError`` because the framework build ships no trust
+store). On a genuine all-tenor failure, :func:`_fetch_fred_curve` classifies the
+underlying cause (SSL/cert, auth/key, network) into an actionable
+:class:`MarketDataError` and chains the original exception. The FRED API key is
+never included in any error message or log (the REST URL carries ``api_key=`` as
+a query param, so we never echo the URL).
 """
 
 from __future__ import annotations
 
 import functools
 import os
+import ssl
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -274,33 +287,140 @@ def static_treasury_curve() -> dict:
     return dict(_STATIC_TREASURY_CURVE)
 
 
+# FRED REST endpoint for the latest observation of a series. We hit this directly
+# with ``requests`` (certifi-backed TLS) instead of fredapi/urllib so the macOS
+# python.org cert gap (PRISM-RCA-003) never bites.
+_FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
+_FRED_TIMEOUT_SECONDS = 15
+
+
+def _looks_like_ssl_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or its cause chain) is a TLS/cert-verification failure."""
+    cursor: BaseException | None = exc
+    while cursor is not None:
+        if isinstance(cursor, ssl.SSLError):
+            return True
+        text = str(cursor)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "unable to get local issuer certificate" in text:
+            return True
+        cursor = cursor.__cause__ or cursor.__context__
+    return False
+
+
+def _classify_fred_failure(exc: BaseException) -> str:
+    """Map a per-series fetch exception to an actionable, key-safe message.
+
+    Called only when *every* tenor failed (a systemic problem), so the message
+    names the real root cause instead of the old "no data for any tenor".
+    The FRED API key is never interpolated into the returned string.
+    """
+    import requests  # local import; classifier only runs on the failure path
+
+    # SSL / certificate trust (the PRISM-RCA-003 macOS case).
+    if _looks_like_ssl_error(exc):
+        return (
+            "FRED fetch failed: SSL certificate verification error "
+            "(could not verify the FRED server certificate). "
+            "Fix: run the python.org 'Install Certificates.command', or set "
+            "SSL_CERT_FILE to your certifi bundle "
+            "(python -c 'import certifi; print(certifi.where())')."
+        )
+
+    # Auth / key rejection: an HTTP 400/403 from the REST API, which FRED returns
+    # for a bad or unregistered api_key.
+    status = None
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+    if status in (400, 401, 403):
+        return "FRED API key appears invalid or unregistered."
+
+    # Network / connectivity (DNS, refused, timeout, generic transport error).
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return "Could not reach FRED (network)."
+
+    # Fallback: name the actual exception type + message so the cause is never
+    # lost. The message text here is series-agnostic and carries no key.
+    return f"FRED fetch failed for all tenors: {type(exc).__name__}: {exc}"
+
+
+def _fetch_one_series(key: str, series_id: str):
+    """Fetch the latest non-missing observation value for a single FRED series.
+
+    Returns the value as a float (still in FRED's PERCENT units) or ``None`` if
+    the series has no usable observation. Raises ``requests``/SSL exceptions on a
+    transport/HTTP failure so the caller can classify them. The key travels only
+    as a request parameter; it is never placed in any raised message.
+    """
+    import requests
+    import certifi
+
+    params = {
+        "series_id": series_id,
+        "api_key": key,
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": 1,
+    }
+    resp = requests.get(
+        _FRED_OBSERVATIONS_URL,
+        params=params,
+        timeout=_FRED_TIMEOUT_SECONDS,
+        verify=certifi.where(),
+    )
+    # raise_for_status surfaces 4xx/5xx (e.g. a rejected key) as requests.HTTPError
+    # WITHOUT including the request URL/key in the str() we propagate downstream.
+    if resp.status_code >= 400:
+        raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+
+    observations = resp.json().get("observations") or []
+    for obs in observations:
+        value = obs.get("value")
+        # FRED encodes missing observations as ".".
+        if value in (None, ".", ""):
+            continue
+        return float(value)
+    return None
+
+
 def _fetch_fred_curve(key: str) -> dict:
     """Fetch the live Treasury curve from FRED. Raises on a genuine failure.
 
     Separated from the cache wrapper so the no-key static path and the keyed live
-    path never share an ``lru_cache`` slot. Always raises
-    :class:`MarketDataError` when no usable data is returned (so a bad key or
-    outage with a key supplied is surfaced, per RCA §6).
+    path never share an ``lru_cache`` slot.
+
+    Individual unavailable tenors are skipped (a couple of missing series must not
+    kill the fetch). But per-series exceptions are *tracked*: if **zero** tenors
+    succeed, the failure is systemic, so we classify the underlying cause
+    (SSL/cert, auth/key, network, or other) into an actionable
+    :class:`MarketDataError` and chain the original exception — never collapsing it
+    into a generic "no data for any tenor". The FRED API key is never echoed in
+    any message (PRISM-RCA-003 §A).
     """
     try:
-        from fredapi import Fred
-    except ImportError as exc:  # pragma: no cover
-        raise MarketDataError("fredapi is not installed") from exc
+        import requests  # noqa: F401 - import here so a missing dep is a clear error
+        import certifi  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - guaranteed by requirements
+        raise MarketDataError(
+            "requests/certifi are not installed; cannot fetch live FRED data"
+        ) from exc
 
-    fred = Fred(api_key=key)
     curve: dict[float, float] = {}
+    last_exc: BaseException | None = None
     for series_id, tenor in _FRED_TREASURY_SERIES.items():
         try:
-            series = fred.get_series(series_id)
-        except Exception:  # noqa: BLE001 - skip unavailable series, keep others
+            latest = _fetch_one_series(key, series_id)
+        except Exception as exc:  # noqa: BLE001 - track, then classify if ALL fail
+            last_exc = exc
             continue
-        if series is None or series.dropna().empty:
+        if latest is None:
             continue
-        latest = float(series.dropna().iloc[-1])
         # FRED reports CMT rates in percent; convert to a fraction.
         curve[tenor] = latest / 100.0
 
     if not curve:
+        if last_exc is not None:
+            raise MarketDataError(_classify_fred_failure(last_exc)) from last_exc
+        # No exception, just genuinely empty data for every tenor.
         raise MarketDataError("FRED returned no Treasury data for any tenor")
     return curve
 

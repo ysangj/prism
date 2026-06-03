@@ -117,75 +117,59 @@ def test_get_treasury_curve_keyed_failure_raises(monkeypatch):
 def test_get_treasury_curve_keyed_empty_series_raises(monkeypatch):
     """Key supplied + a FRED that yields no usable series -> raises (real path).
 
-    Mocks ``fredapi.Fred`` so ``_fetch_fred_curve`` runs end-to-end with empty
-    series and produces the genuine empty-result MarketDataError.
+    PRISM-RCA-003: the transport moved from ``fredapi.Fred`` to a ``requests``-based
+    per-series fetch. We mock the new seam ``market_data._fetch_one_series`` to
+    return ``None`` for every tenor (the genuine "no usable observation" case,
+    OFFLINE — no network), exercising the empty-result ``MarketDataError`` path.
     """
     market_data.get_treasury_curve.cache_clear()
 
-    import types
+    seen_keys: set[str] = set()
 
-    class _FakeSeries:
-        def dropna(self):
-            return self
+    def _empty_series(key, series_id):
+        # Sanity: the key is forwarded to the per-series fetch unchanged.
+        seen_keys.add(key)
+        return None  # no usable observation for any series; NO network call
 
-        @property
-        def empty(self):
-            return True
+    monkeypatch.setattr(market_data, "_fetch_one_series", _empty_series)
 
-    class _FakeFred:
-        def __init__(self, api_key=None):
-            # Sanity: the key is forwarded to the FRED client unchanged.
-            assert api_key == FAKE_FRED_KEY
-
-        def get_series(self, series_id):
-            return _FakeSeries()
-
-    fake_mod = types.ModuleType("fredapi")
-    fake_mod.Fred = _FakeFred
-    monkeypatch.setitem(sys.modules, "fredapi", fake_mod)
-
-    with pytest.raises(MarketDataError):
+    with pytest.raises(MarketDataError) as exc:
         market_data.get_treasury_curve(api_key=FAKE_FRED_KEY)
+    # Genuinely-empty path keeps the legacy message (no exception was thrown).
+    assert "no Treasury data for any tenor" in str(exc.value)
+    assert seen_keys == {FAKE_FRED_KEY}, "key not forwarded to per-series fetch"
+    assert FAKE_FRED_KEY not in str(exc.value), "key leaked into error message"
     market_data.get_treasury_curve.cache_clear()
 
 
 def test_get_treasury_curve_keyed_success_returns_fractions(monkeypatch):
-    """Key supplied + a healthy mocked FRED -> live curve as fractions, no raise."""
+    """Key supplied + a healthy mocked FRED -> live curve as fractions, no raise.
+
+    PRISM-RCA-003: re-pointed off the removed ``fredapi.Fred`` seam onto the new
+    ``market_data._fetch_one_series`` (the per-series ``requests`` fetch). It
+    returns FRED's PERCENT value; the backend divides by 100 to a fraction. No
+    network: the seam is fully mocked.
+    """
     market_data.get_treasury_curve.cache_clear()
 
-    import types
+    seen_keys: set[str] = set()
 
-    class _Series:
-        def __init__(self, last):
-            self._last = last
+    def _ok_series(key, series_id):
+        # FRED reports CMT in PERCENT; backend divides by 100.
+        seen_keys.add(key)
+        return 4.25
 
-        def dropna(self):
-            return self
-
-        @property
-        def empty(self):
-            return False
-
-        @property
-        def iloc(self):
-            return {-1: self._last}
-
-    class _FakeFred:
-        def __init__(self, api_key=None):
-            assert api_key == FAKE_FRED_KEY
-
-        def get_series(self, series_id):
-            # FRED reports CMT in PERCENT; backend divides by 100.
-            return _Series(4.25)
-
-    fake_mod = types.ModuleType("fredapi")
-    fake_mod.Fred = _FakeFred
-    monkeypatch.setitem(sys.modules, "fredapi", fake_mod)
+    monkeypatch.setattr(market_data, "_fetch_one_series", _ok_series)
 
     curve = market_data.get_treasury_curve(api_key=FAKE_FRED_KEY)
     assert curve, "live curve should be non-empty"
+    # Every standard tenor is present.
+    assert sorted(curve) == pytest.approx(
+        sorted(market_data._FRED_TREASURY_SERIES.values())
+    )
     for rate in curve.values():
         assert rate == pytest.approx(0.0425)  # 4.25% -> fraction
+    assert seen_keys == {FAKE_FRED_KEY}, "key not forwarded to per-series fetch"
     market_data.get_treasury_curve.cache_clear()
 
 

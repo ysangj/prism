@@ -570,11 +570,19 @@ if submitted:
                 "demo_mode": demo_mode,
             }
         except MarketDataError as exc:
+            # RCA-003 §7C: the backend now raises a SPECIFIC, user-safe message
+            # for a genuine keyed-fetch failure — SSL/cert + one-line remedy,
+            # "FRED API key appears invalid or unregistered.", or "Could not reach
+            # FRED (network).". These never contain the API key (BACKEND_NOTES.md),
+            # so we surface str(exc) verbatim as the HEADLINE cause instead of the
+            # old generic "no data" message. The demo/FRED-key guidance drops to a
+            # secondary line. We still never render a raw traceback.
             st.session_state["result"] = None
-            st.error(
-                f"Could not fetch market data: {exc}\n\n"
-                "Tip: turn on **Use demo market data** in the sidebar, or set a "
-                "`FRED_API_KEY` for the live Treasury curve.")
+            st.error(f"Live market data unavailable: {exc}", icon="🚫")
+            st.caption(
+                "Tip: turn on **Use demo market data** in the sidebar for "
+                "deterministic offline pricing, or check your **FRED API key** "
+                "for the live Treasury curve.")
         except Exception as exc:  # defensive: friendly message, no traceback
             st.session_state["result"] = None
             st.error(f"Pricing failed: {exc}")
@@ -600,11 +608,15 @@ st.subheader("2 · Component decomposition")
 # used (no FRED key in live mode). This is NOT an error: pricing succeeded with a
 # documented fallback curve. Independent of low_confidence_vol; render separately.
 if getattr(result, "low_confidence_curve", False):
+    # RCA-003 §7C.2: this banner is specifically the NO-KEY path. A keyed live
+    # fetch that genuinely FAILS now raises MarketDataError (surfaced in the
+    # error path above with its specific cause), so it never reaches this banner.
+    # Keep this wording unambiguously about "no FRED key provided".
     st.warning(
-        "⚠️ **Low-confidence Treasury curve:** no FRED key was available, so a "
-        "static fallback curve was used — interest-rate inputs are approximate. "
-        "Add a **FRED API key** in the sidebar (or set `FRED_API_KEY`) for the "
-        "live curve.",
+        "⚠️ **Low-confidence Treasury curve — no FRED key provided.** A static "
+        "fallback curve was used, so interest-rate inputs are approximate. Add a "
+        "**FRED API key** in the sidebar (or set `FRED_API_KEY`) for the live "
+        "curve.",
         icon="⚠️")
 if getattr(result, "low_confidence_vol", False):
     st.warning("⚠️ Low-confidence volatility: the options chain was sparse, so a "

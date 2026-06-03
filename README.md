@@ -66,6 +66,19 @@ echo 'FRED_API_KEY=your-key-here' > .env
 
 **Never commit API keys.** Keep them in your shell env or a local `.env` that stays out of git.
 
+### Live FRED data on macOS (SSL/certificates)
+
+The live Treasury-curve fetch verifies HTTPS against the bundled `certifi` CA store, so it works out of the box after `pip install -r requirements.txt` — no extra setup needed. If you still see an SSL / certificate error when pulling live FRED data (older python.org builds whose certs were never installed), either run the one-time installer or point Python at certifi:
+
+```bash
+# one-time, permanent (python.org build):
+/Applications/Python\ 3.12/Install\ Certificates.command
+# or per shell session:
+export SSL_CERT_FILE="$(.venv/bin/python -c 'import certifi; print(certifi.where())')"
+```
+
+When a live fetch fails, the app now reports the **specific** cause — SSL/cert (with this remedy), an invalid/unregistered key, or a network problem — instead of a generic error. With no FRED key at all, it just uses the static fallback curve (low-confidence).
+
 ## Run the web app
 
 ```bash
