@@ -10,3 +10,4 @@ plotly>=5.20
 anthropic>=0.40
 reportlab>=4.0
 pytest>=8.0
+pypdf>=4.0          # dev/test only — validates generated PDF reports
