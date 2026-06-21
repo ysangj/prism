@@ -101,10 +101,13 @@ def payoff_diagram(result) -> go.Figure:
             x0, x1 = xs[i - 1], xs[i]
             y0, y1 = ys[i - 1], ys[i]
             be = x0 if y1 == y0 else x0 + (0 - y0) * (x1 - x0) / (y1 - y0)
+            # Annotate at the BOTTOM of the plot so the breakeven label can't
+            # collide with the title or the (now bottom-anchored) legend, which
+            # previously crowded the top of the chart (2026-06-20 UX — polish #3).
             fig.add_vline(
                 x=be, line_dash="dash", line_color="#c0392b",
                 annotation_text=f"Breakeven {be:.0f}%",
-                annotation_position="top",
+                annotation_position="bottom",
             )
             break
 
@@ -112,10 +115,14 @@ def payoff_diagram(result) -> go.Figure:
         title="Payoff at maturity",
         xaxis_title="Underlier performance (%)",
         yaxis_title="Total return to investor (%)",
-        height=460,
+        height=480,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        margin=dict(l=60, r=20, t=70, b=50),
+        # Legend moved BELOW the plot (was top, y=1.02) so it no longer overlaps
+        # the title / breakeven annotation. Extra bottom margin keeps it clear of
+        # the x-axis title (2026-06-20 UX — polish #3).
+        legend=dict(orientation="h", yanchor="top", y=-0.22,
+                    xanchor="center", x=0.5),
+        margin=dict(l=60, r=20, t=60, b=90),
     )
     return fig
 

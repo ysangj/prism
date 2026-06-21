@@ -6,19 +6,45 @@ Prism decomposes a structured financial product (autocallables, reverse converti
 
 > **Status: Phase 2 complete.** Prism now ships the full **Streamlit web app** plus the importable pricing library, covering all **five product types** — Autocallable, Reverse Convertible, Principal-Protected Note, Barrier (Digital) Note, and Buffered (Accelerated) Note — and BYOK Claude-powered PDF term-sheet extraction. See [`PRD.md`](PRD.md) §13 for the roadmap (Phase 3: PDF report export, methodology docs, deployment).
 
-## Quickstart
+## Quickstart — one command
+
+The launcher scripts do everything for you: find a suitable Python, create the virtualenv, install dependencies, and start the app. You only need **Python 3.11+** installed ([python.org/downloads](https://www.python.org/downloads/)).
+
+**macOS / Linux:**
 
 ```bash
-# 1. set up the environment (first time only)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 2. launch the web app
-streamlit run app.py
+./run.sh
 ```
 
-Then open **<http://localhost:8501>** in your browser. The form is pre-filled with a sample product and **Demo market data** is on by default, so just click **Analyze** — no network or API key needed.
+**Windows:**
+
+```bat
+run.bat
+```
+
+That's it — the script bootstraps the environment (first run installs dependencies, ~1–2 min; later runs start in seconds) and opens **<http://localhost:8501>** in your browser. The form is pre-filled with a sample product and **Demo market data** is on by default, so just click **Analyze** — no network or API key needed.
+
+Pass extra Streamlit options after `--`, e.g. a different port:
+
+```bash
+./run.sh -- --server.port 8600
+```
+
+> The launcher never requires or echoes any API key. Optional keys (FRED, Anthropic) can go in a local `.env` — see [API keys](#api-keys).
+
+### Manual setup (alternative)
+
+Prefer to manage the environment yourself?
+
+```bash
+# first time only
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# launch
+streamlit run app.py
+```
 
 > Already inside the `.venv`? Just run `streamlit run app.py`. Prefer not to activate it? Use `.venv/bin/python -m streamlit run app.py`.
 
@@ -83,11 +109,13 @@ When a live fetch fails, the app now reports the **specific** cause — SSL/cert
 
 ## Run the web app
 
+Easiest: use the one-command launcher — `./run.sh` (macOS/Linux) or `run.bat` (Windows) — see [Quickstart](#quickstart--one-command). To run it yourself from an existing environment:
+
 ```bash
 .venv/bin/python -m streamlit run app.py
 ```
 
-Opens at <http://localhost:8501>. The form is pre-filled with the canonical 5-year AAPL autocallable and **Demo market data** is on by default, so you can click **Analyze** immediately — no network or API key required. Switch the product type to try the other four; toggle demo mode off to pull live market data (works even without a FRED key — it uses a static curve and shows a low-confidence notice); paste an Anthropic key in the sidebar to enable PDF term-sheet upload (sample term sheets live in [`test_pdfs/`](test_pdfs/)).
+Opens at <http://localhost:8501>. The form is pre-filled with the canonical 5-year AAPL autocallable and **Demo market data** is on by default, so you can click **Analyze** immediately — no network or API key required. Switch the product type to try the other four; toggle demo mode off to pull live market data (works even without a FRED key — it uses a static curve and shows a low-confidence notice); paste an Anthropic key in the sidebar to enable PDF term-sheet upload (sample term sheets live in [`test_pdfs/`](test_pdfs/)). Export any analysis with the **⬇️ Download PDF report** button at the top of the results.
 
 ## PDF term-sheet upload — what can and can't be parsed
 

@@ -1,0 +1,7 @@
+# Windows batch files must use CRLF line endings.
+# cmd.exe seeks goto/labels by byte offset; LF-only .bat files can mis-seek
+# (e.g. the :shiftloop/:shiftdone arg-passthrough loop in run.bat).
+*.bat text eol=crlf
+
+# Shell scripts must stay LF so they remain executable on POSIX systems.
+*.sh  text eol=lf

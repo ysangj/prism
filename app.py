@@ -22,7 +22,7 @@ import os
 import streamlit as st
 
 import prism
-from prism import price_product
+from prism import build_report_pdf, price_product, report_filename
 from prism.market_data import MarketDataError
 
 # RCA-002 §7C / §A: autoload a local `.env` ONCE at startup, before any env var
@@ -39,6 +39,12 @@ from prism.pdf_parser import (
 )
 
 from prism_ui import charts
+from prism_ui.narrative import (
+    decomposition_takeaway as _decomposition_takeaway,
+    histogram_takeaway as _histogram_takeaway,
+    margin_verdict as _margin_verdict,
+    payoff_takeaway as _payoff_takeaway,
+)
 from prism_ui.config import (
     BARRIER_TYPES,
     OBSERVATION_FREQS,
@@ -117,6 +123,49 @@ st.set_page_config(page_title="Prism — Structured Product Decomposition",
 
 
 # ----------------------------------------------------------------------------
+# Brand styling for the Analyze submit button (2026-06-15 UX — moderate #1)
+# ----------------------------------------------------------------------------
+# The `type="primary"` submit button otherwise renders in the theme primary
+# color (reads as red). We override JUST the form-submit button (Streamlit 1.58
+# wrapper testid `stFormSubmitButton`) with the brand violet→magenta gradient
+# from the diamond mark. Scope is deliberately narrow so other buttons (Dismiss,
+# Extract from PDF) are untouched, and the disabled state stays visually
+# distinct (muted, not-allowed cursor) so a blocked Analyze never looks
+# clickable. Verified selector against streamlit/static (FormSubmitContent JS).
+st.markdown(
+    """
+    <style>
+    div[data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(95deg, #7c3aed 0%, #c026d3 55%, #ec4899 100%);
+        color: #ffffff !important;
+        border: 0 !important;
+        font-weight: 600;
+        box-shadow: 0 1px 6px rgba(124, 58, 237, 0.35);
+        transition: filter 0.15s ease, box-shadow 0.15s ease;
+    }
+    div[data-testid="stFormSubmitButton"] button:hover:not(:disabled) {
+        filter: brightness(1.08);
+        box-shadow: 0 2px 10px rgba(192, 38, 211, 0.45);
+        color: #ffffff !important;
+    }
+    div[data-testid="stFormSubmitButton"] button:active:not(:disabled) {
+        filter: brightness(0.95);
+    }
+    /* Keep the disabled (refusal-blocked) state clearly NON-clickable. */
+    div[data-testid="stFormSubmitButton"] button:disabled {
+        background: #3a3550;
+        color: rgba(255, 255, 255, 0.45) !important;
+        box-shadow: none;
+        cursor: not-allowed;
+        filter: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ----------------------------------------------------------------------------
 # Cached pricing wrapper (PRD §15.6 — don't re-hit APIs on every rerun)
 # ----------------------------------------------------------------------------
 def _fred_key_token(fred_api_key: str | None) -> str:
@@ -167,6 +216,49 @@ def _price_cached(product_type: str, shared_key: tuple, per_type_key: tuple,
 
 
 # ----------------------------------------------------------------------------
+# Cached PDF-report builder (PRD §8.5 — "Download PDF report")
+# ----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _report_bytes_cached(product_type: str, shared_key: tuple,
+                         per_type_key: tuple, demo_mode: bool, n_paths: int,
+                         generated_at: str, _result):
+    """Build the analysis-only valuation PDF and return raw bytes.
+
+    Keyed on the SAME serializable primitives as `_price_cached` (product_type +
+    shared_key + per_type_key + demo_mode + n_paths) PLUS the pinned
+    `generated_at` timestamp, so the bytes are stable across Streamlit reruns and
+    are not regenerated on every interaction. `generated_at` is pinned to when
+    Analyze ran (stored in session at price time) so the cache key — and the
+    report's header/filename date — don't drift on each rerun.
+
+    `_result` is the already-computed `DecompositionResult`; the leading
+    underscore excludes it from the cache key (it's a dataclass of lists/floats
+    that's expensive/unstable to hash, and it's fully determined by the keyed
+    primitives anyway). `build_report_pdf` is pure/offline — no re-pricing, no
+    network. The product dataclass is rebuilt from the same primitive keys used
+    for pricing (mirrors `_price_cached`).
+
+    `meta` carries ONLY presentation context (demo flag, timestamp, path count,
+    data-source label) — never any API key or secret (BACKEND_NOTES.md §meta).
+    """
+    shared = dict(shared_key)
+    shared["maturity"] = datetime.date.fromisoformat(shared["maturity"])
+    per_type_human = dict(per_type_key)
+    product = build_product(product_type, shared, per_type_human)
+
+    meta = {
+        "demo_mode": demo_mode,
+        "generated_at": generated_at,
+        "n_paths": int(n_paths),
+        "data_source": ("Demo (offline)" if demo_mode
+                        else "Live (yfinance + FRED)"),
+    }
+    pdf_bytes = build_report_pdf(product, _result, meta=meta)
+    fname = report_filename(product, meta)
+    return pdf_bytes, fname
+
+
+# ----------------------------------------------------------------------------
 # Session state init
 # ----------------------------------------------------------------------------
 def _init_state():
@@ -180,6 +272,13 @@ def _init_state():
     ss.setdefault("product_type", DEFAULT_PRODUCT_TYPE)
     ss.setdefault("result", None)
     ss.setdefault("priced_meta", None)
+    # PDF-report (PRD §8.5) inputs captured at price time so the "Download PDF
+    # report" button can rebuild the priced product + assemble meta WITHOUT
+    # re-pricing, and with a timestamp pinned to the Analyze run (not the rerun).
+    #   report_keys      -> (product_type, shared_key, per_type_key, demo, n_paths)
+    #   report_generated -> ISO timestamp pinned at the moment Analyze succeeded
+    ss.setdefault("report_keys", None)
+    ss.setdefault("report_generated", None)
     # Refusal surface (RCA §7C): set when a PDF upload is out-of-scope.
     #   None        -> no active refusal
     #   list[str]   -> reasons to render; while set, Analyze is disabled so the
@@ -212,6 +311,69 @@ def _init_state():
 def _pt_key(product_type: str, field_key: str) -> str:
     """Namespaced session-state key for a per-type form field."""
     return f"pt_{product_type}_{field_key}"
+
+
+def _key_field(*, session_key: str, edit_flag: str, label: str, caption: str,
+               link_md: str, placeholder: str, current_value: str) -> str:
+    """Render a BYOK key field as either an input or a collapsed ✓ chip.
+
+    2026-06-15 UX (moderate #2 + #4): once a key is set, hide the raw password
+    input behind a compact green "✓ key set · edit" chip; an Edit toggle reveals
+    the input again so the user can change/clear it. The caption (with the
+    get-a-key link) is always shown so a key-less user sees the link, and an
+    editing user does too. The key value is NEVER displayed in plaintext.
+
+    Returns the (stripped) key string to store back in session state. Callers
+    keep their existing session keys / fallback semantics unchanged.
+
+    Args:
+        session_key:  st.session_state key holding the secret (e.g. "anthropic_key").
+        edit_flag:    st.session_state key for the show/edit toggle (bool).
+        label:        accessibility label for the input (collapsed visually).
+        caption:      explanatory caption shown above the field/chip.
+        link_md:      markdown "get a key" link, shown under the caption.
+        placeholder:  input placeholder text.
+        current_value: the current key value (already in session_state).
+    """
+    ss = st.session_state
+    ss.setdefault(edit_flag, False)
+    st.caption(caption)
+    st.markdown(link_md)
+
+    has_value = bool(current_value)
+    # Show the input when there's no key yet, OR the user clicked Edit.
+    show_input = (not has_value) or ss[edit_flag]
+
+    if not show_input:
+        # Collapsed: green ✓ status chip + an Edit affordance. The value is
+        # never rendered — only the fact that a key is set.
+        chip_col, btn_col = st.columns([3, 1])
+        with chip_col:
+            st.success("✓ key set", icon="✅")
+        with btn_col:
+            if st.button("Edit", key=f"{edit_flag}_edit_btn",
+                         help="Change or clear this key."):
+                ss[edit_flag] = True
+                st.rerun()
+        return current_value
+
+    # Expanded: the password input (today's behavior).
+    typed = st.text_input(
+        label,
+        value=current_value,
+        type="password",
+        placeholder=placeholder,
+        label_visibility="collapsed",
+    )
+    typed = typed.strip()
+    # If a key is set and the user is in edit mode, offer a Done button to
+    # collapse back to the chip (only meaningful once a value exists).
+    if has_value and ss[edit_flag]:
+        if st.button("Done", key=f"{edit_flag}_done_btn",
+                     help="Collapse this field back to the status chip."):
+            ss[edit_flag] = False
+            st.rerun()
+    return typed
 
 
 _init_state()
@@ -275,50 +437,46 @@ with st.sidebar:
              "needed. OFF: fetch live spot/vol/rates (needs internet and a "
              "FRED_API_KEY for the Treasury curve).",
     )
-    n_paths = st.select_slider(
-        "Monte Carlo paths",
-        options=[10_000, 25_000, 50_000, 100_000],
-        value=50_000,
-        help="More paths = smoother estimates, slower pricing. 100k targets "
-             "<5s (PRD §9).",
-    )
 
     st.divider()
     st.subheader("🔑 Anthropic API key (BYOK)")
-    st.caption(
-        "Used only for PDF term-sheet parsing. Stored in this session's memory "
-        "only — never written to disk or logged (PRD §9)."
-    )
-    key_input = st.text_input(
-        "Anthropic API key",
-        value=st.session_state["anthropic_key"],
-        type="password",
+    # 2026-06-15 UX (#2 + #4): collapse to a ✓ chip once set; always-visible
+    # get-a-key link. Order preserved (Anthropic before FRED). Session key and
+    # `has_key` semantics unchanged.
+    st.session_state["anthropic_key"] = _key_field(
+        session_key="anthropic_key",
+        edit_flag="_anthropic_key_edit",
+        label="Anthropic API key",
+        caption=("Used only for PDF term-sheet parsing. Stored in this "
+                 "session's memory only — never written to disk or logged "
+                 "(PRD §9)."),
+        link_md="[Get an Anthropic API key ↗](https://console.anthropic.com/)",
         placeholder="sk-ant-...",
-        label_visibility="collapsed",
+        current_value=st.session_state["anthropic_key"],
     )
-    st.session_state["anthropic_key"] = key_input.strip()
     has_key = bool(st.session_state["anthropic_key"])
 
     st.divider()
     st.subheader("🔑 FRED API key (optional)")
-    st.caption(
-        "Used only for the **live U.S. Treasury yield curve** (live market mode, "
-        "demo OFF). Without it, Prism uses a documented static fallback curve and "
-        "flags the result **low confidence**. Stored in this session's memory "
-        "only — never written to disk or logged (PRD §9). Can also live in a "
-        "local `.env` as `FRED_API_KEY`."
-    )
-    fred_input = st.text_input(
-        "FRED API key",
-        value=st.session_state["fred_key"],
-        type="password",
-        placeholder="FRED API key (optional)",
-        label_visibility="collapsed",
-    )
     # Sidebar field overrides the env/.env-seeded value, but a blank field falls
     # back to whatever the environment provides (so a .env key still works even
-    # if the user never types into the box).
-    st.session_state["fred_key"] = fred_input.strip()
+    # if the user never types into the box). The chip treats an env/.env-seeded
+    # key as "set" because `fred_key` was pre-seeded from FRED_API_KEY at init.
+    st.session_state["fred_key"] = _key_field(
+        session_key="fred_key",
+        edit_flag="_fred_key_edit",
+        label="FRED API key",
+        caption=("Used only for the **live U.S. Treasury yield curve** (live "
+                 "market mode, demo OFF). Without it, Prism uses a documented "
+                 "static fallback curve and flags the result **low "
+                 "confidence**. Stored in this session's memory only — never "
+                 "written to disk or logged (PRD §9). Can also live in a local "
+                 "`.env` as `FRED_API_KEY`."),
+        link_md=("[Get a free FRED API key ↗]"
+                 "(https://fredaccount.stlouisfed.org/apikeys)"),
+        placeholder="FRED API key (optional)",
+        current_value=st.session_state["fred_key"],
+    )
     fred_key = st.session_state["fred_key"] or (os.environ.get("FRED_API_KEY") or "").strip()
 
     st.divider()
@@ -367,6 +525,22 @@ with st.sidebar:
                     st.success("Fields extracted. Review/edit below, then click "
                                "Analyze.")
                     st.rerun()
+
+    # ------------------------------------------------------------------------
+    # Advanced settings (2026-06-15 UX — moderate #3): the Monte Carlo paths
+    # slider moves out of the top of the sidebar into a collapsed expander near
+    # the bottom, so the common path (demo → keys → upload) stays uncluttered.
+    # Same options/default; `n_paths` still feeds `_price_cached` unchanged.
+    # ------------------------------------------------------------------------
+    st.divider()
+    with st.expander("⚙️ Advanced settings", expanded=False):
+        n_paths = st.select_slider(
+            "Monte Carlo paths",
+            options=[10_000, 25_000, 50_000, 100_000],
+            value=50_000,
+            help="More paths = smoother estimates, slower pricing. 100k targets "
+                 "<5s (PRD §9).",
+        )
 
 
 # ============================================================================
@@ -569,6 +743,14 @@ if submitted:
                 "underlier": shared["underlier"],
                 "demo_mode": demo_mode,
             }
+            # PRD §8.5: stash the serializable pricing keys + a pinned timestamp
+            # so the results page can build the export PDF (rebuilding the priced
+            # product from the same primitives) without re-pricing, and so the
+            # report's date/filename stay stable across reruns.
+            st.session_state["report_keys"] = (
+                product_type, shared_key, per_type_key, demo_mode, int(n_paths))
+            st.session_state["report_generated"] = (
+                datetime.datetime.now().isoformat())
         except MarketDataError as exc:
             # RCA-003 §7C: the backend now raises a SPECIFIC, user-safe message
             # for a genuine keyed-fetch failure — SSL/cert + one-line remedy,
@@ -624,39 +806,116 @@ if getattr(result, "low_confidence_vol", False):
 for note in getattr(result, "notes", []) or []:
     st.caption(f"ℹ️ {note}")
 
-d1, d2, d3, d4 = st.columns(4)
-d1.metric("Bond floor", fmt_currency(result.bond_floor),
-          fmt_pct(pct_of_notional(result.bond_floor, notional)) + " of notional")
-d2.metric("Option value", fmt_currency(result.option_value),
-          fmt_pct(pct_of_notional(result.option_value, notional)) + " of notional")
-d3.metric("Fair value", fmt_currency(result.fair_value),
-          fmt_pct(pct_of_notional(result.fair_value, notional)) + " of notional")
-d4.metric(
-    "Embedded margin", fmt_signed_currency(result.embedded_margin),
-    fmt_pct(result.margin_pct) + " of notional",
-    delta_color="inverse",
+# ----------------------------------------------------------------------------
+# HERO verdict (UX feedback 2026-06-15): the embedded margin is the headline.
+# Plain-language verdict from the INVESTOR's perspective. A positive margin
+# (you pay above fair value) is BAD for the buyer, so we color it as a caution,
+# not as "good/up". No ambiguous green↑/red↑ arrows — a clear worded verdict
+# with a subtle colored callout.
+# ----------------------------------------------------------------------------
+headline, explanation, sentiment = _margin_verdict(result)
+# Subtle sentiment color via Streamlit's status callouts:
+#   bad-for-buyer (overpriced) -> warning (amber)
+#   good-for-buyer (at/below fair value) -> success (green)
+#   roughly fair -> neutral info
+_hero = {"warn": st.warning, "good": st.success, "neutral": st.info}[sentiment]
+st.markdown(f"### {headline}")
+# Hero metric: the embedded margin, given the dominant (wide) slot. delta_color
+# "off" avoids the ambiguous green↑/red↑ arrows flagged in user feedback — the
+# colored verdict callout below carries the sentiment instead.
+hero_col, _spacer = st.columns([2, 3])
+# 2026-06-20 UX — polish #2: the "% of notional" descriptor used to ride in the
+# metric's DELTA slot, which Streamlit renders as a colored ↑/↓ arrow even though
+# it is NOT a change. Fold it into the value string and a caption instead, and
+# pass NO delta — so the hero magnitude reads cleanly with no (even greyed) arrow.
+hero_col.metric(
+    "Embedded margin",
+    f"{fmt_signed_currency(result.embedded_margin)} "
+    f"({fmt_pct(result.margin_pct)} of notional)",
     help="Offer price minus fair value — the issuer's embedded fee. Positive "
          "means you pay more than the components are worth.")
+hero_col.caption(f"{fmt_pct(result.margin_pct)} of notional.")
+_hero(explanation)
+st.caption("Embedded margin is the headline result: offer price minus the "
+           "independently estimated fair value of the note's components.")
+
+# ----------------------------------------------------------------------------
+# Download PDF report (PRD §8.5) — the clean, analysis-only export. This replaces
+# the browser Print button (which dumped the sidebar/settings too). Built
+# server-side from the already-priced `result` (no re-pricing, no network) and
+# cached on the same primitives as pricing + a pinned timestamp, so repeated
+# reruns don't regenerate it. Failures degrade to a friendly warning — the
+# results page never crashes and no secret/traceback is ever shown.
+# ----------------------------------------------------------------------------
+_report_keys = st.session_state.get("report_keys")
+if _report_keys is not None:
+    try:
+        _r_ptype, _r_shared, _r_per_type, _r_demo, _r_paths = _report_keys
+        _pdf_bytes, _pdf_fname = _report_bytes_cached(
+            _r_ptype, _r_shared, _r_per_type, _r_demo, _r_paths,
+            st.session_state.get("report_generated") or
+            datetime.datetime.now().isoformat(),
+            result,
+        )
+        st.download_button(
+            "⬇️ Download PDF report",
+            data=_pdf_bytes,
+            file_name=_pdf_fname,
+            mime="application/pdf",
+            type="secondary",
+            help="Download a clean, analysis-only PDF of this valuation "
+                 "(decomposition, payoff, risk, market snapshot, methodology). "
+                 "Use this instead of the browser Print button — it excludes the "
+                 "Settings sidebar.",
+        )
+    except Exception as exc:  # never crash the results; never leak a traceback
+        st.warning(
+            f"Couldn't generate the PDF report: {exc} — the on-screen analysis "
+            "above is unaffected.", icon="⚠️")
+
+# Demoted breakdown — the three component metrics, now visually subordinate.
+# 2026-06-20 UX — polish #2: the "% of notional" descriptor no longer rides in
+# the DELTA slot (which rendered a misleading colored arrow). It now shows as an
+# on-screen caption under each metric; the metrics carry no delta/arrow at all.
+st.markdown("**Breakdown**")
+b1, b2, b3 = st.columns(3)
+b1.metric("Bond floor", fmt_currency(result.bond_floor))
+b1.caption(fmt_pct(pct_of_notional(result.bond_floor, notional)) + " of notional")
+b2.metric("Option value", fmt_currency(result.option_value))
+b2.caption(fmt_pct(pct_of_notional(result.option_value, notional)) + " of notional")
+b3.metric("Fair value", fmt_currency(result.fair_value))
+b3.caption(fmt_pct(pct_of_notional(result.fair_value, notional)) + " of notional")
 
 st.plotly_chart(charts.decomposition_bar(result, notional),
                 width='stretch')
 
-if result.embedded_margin > 0:
-    st.caption(f"You pay **{fmt_currency(result.embedded_margin)}** "
-               f"({fmt_pct(result.margin_pct)} of notional) above the estimated "
-               "fair value of the components.")
-else:
-    st.caption("The offer price is at or below the estimated fair value of the "
-               "components (no positive embedded margin detected for these inputs).")
+# 2026-06-20 UX — polish #1: a SHORT, secondary "how to read this" orientation
+# note (how to read the chart itself), visually lighter (st.caption) and kept
+# DISTINCT from the "What this means" finding callout (st.info) below. Order is
+# consistent across all three charts: chart → 📖 How to read → What this means.
+st.caption("📖 **How to read this:** A single stacked bar showing how your offer "
+           "price splits into the bond floor, the option value, and the issuer's "
+           "embedded margin — a taller margin segment = more you pay over fair "
+           "value.")
+# Plain-language takeaway for the decomposition chart (UX feedback): break the
+# offer price into bond / option / margin shares so it's specific, not generic.
+st.info("**What this means:** " + _decomposition_takeaway(result))
 
 
 # ----------------------------------------------------------------------------
 st.divider()
 st.subheader("3 · Payoff at maturity")
 st.plotly_chart(charts.payoff_diagram(result), width='stretch')
-st.caption("Blue = this note's total return to the investor (incl. coupons). "
-           "Grey dotted = a direct 1:1 position in the underlier, for comparison. "
-           "Hover for exact values.")
+# 2026-06-20 UX — polish #1: single "how to read this" orientation caption. The
+# prior technical blue/grey legend caption is FOLDED IN here so there aren't two
+# overlapping caption lines saying similar things. Kept distinct from (and above)
+# the "What this means" finding callout. Order matches the other two charts.
+st.caption("📖 **How to read this:** X-axis = how the underlier moves by "
+           "maturity, Y-axis = your total return. The solid blue line is this "
+           "note (incl. coupons); the grey dotted line is a plain 1:1 position "
+           "in the underlier, for comparison. Hover for exact values.")
+# Plain-language takeaway (UX feedback): the finding, in lay terms.
+st.info("**What this means:** " + _payoff_takeaway(result, meta))
 
 
 # ----------------------------------------------------------------------------
@@ -667,30 +926,50 @@ returns = result.return_distribution
 mean_return_pct = (sum(returns) / len(returns) * 100.0) if returns else 0.0
 max_loss_pct = (min(returns) * 100.0) if returns else 0.0
 
-r1, r2, r3 = st.columns(3)
-r1.metric("Delta", f"${result.greeks.get('delta', 0):,.0f}",
-          help="$ change in fair value per +1% move in the underlier.")
-r2.metric("Vega", f"${result.greeks.get('vega', 0):,.0f}",
-          help="$ change per +1 vol point.")
-r3.metric("Rho", f"${result.greeks.get('rho', 0):,.0f}",
-          help="$ change per +1bp parallel shift in the risk-free rate.")
-
+# UX feedback (2026-06-15): lead with the intuitive, plain-English metrics;
+# Greeks stay visible but become the secondary, more-technical row. Each metric
+# gets a one-line plain definition shown ON SCREEN (st.caption), not just in the
+# hover `help=` tooltip.
 r4, r5, r6 = st.columns(3)
 r4.metric("P(loss)", fmt_pct(result.prob_loss * 100.0, dp=1),
           help="Fraction of Monte Carlo paths ending with principal loss.")
+r4.caption("How often you end up losing money, across all simulated outcomes.")
 r5.metric("Expected return", fmt_pct(mean_return_pct, dp=1),
           help="Mean total return across all simulated paths (over the life of "
                "the note).")
+r5.caption("The average total return over the note's life across all scenarios.")
 r6.metric("Max-loss scenario", fmt_pct(max_loss_pct, dp=1),
           help="Worst per-path total return observed in the simulation.")
+r6.caption("The worst single outcome the simulation produced.")
+
+st.markdown("**Sensitivities (Greeks)** — more technical")
+r1, r2, r3 = st.columns(3)
+r1.metric("Delta", f"${result.greeks.get('delta', 0):,.0f}",
+          help="$ change in fair value per +1% move in the underlier.")
+r1.caption("How much the note's value moves when the underlier moves.")
+r2.metric("Vega", f"${result.greeks.get('vega', 0):,.0f}",
+          help="$ change per +1 vol point.")
+r2.caption("Sensitivity to changes in volatility.")
+r3.metric("Rho", f"${result.greeks.get('rho', 0):,.0f}",
+          help="$ change per +1bp parallel shift in the risk-free rate.")
+r3.caption("Sensitivity to changes in interest rates.")
 
 st.plotly_chart(charts.return_histogram(result), width='stretch')
+# 2026-06-20 UX — polish #1: secondary "how to read this" orientation caption,
+# distinct from the "What this means" finding below. Order consistent across charts.
+st.caption("📖 **How to read this:** Each bar counts how many simulated scenarios "
+           "landed in that return range; bars left of 0% are losses, bars right "
+           "of 0% are gains.")
+# Plain-language takeaway (UX feedback): reuse the SAME numbers shown in the
+# metric cards above so the finding and the cards stay consistent.
+st.info("**What this means:** " + _histogram_takeaway(
+    result, mean_return_pct, max_loss_pct))
 
 
 # ----------------------------------------------------------------------------
 # Market inputs used (transparency)
 # ----------------------------------------------------------------------------
-with st.expander("Market inputs used in this valuation"):
+with st.expander("Market inputs used in this valuation", expanded=True):
     m = st.columns(5)
     m[0].metric("Spot", f"${getattr(result, 'spot', float('nan')):,.2f}")
     m[1].metric("Risk-free", fmt_pct(getattr(result, 'risk_free', 0) * 100, 2))

@@ -35,10 +35,13 @@ from .models import (
     tenor_years,
 )
 from .pricing import black_scholes, monte_carlo, payoffs
+from .report import build_report_pdf, report_filename
 
 __all__ = [
     "price_product",
     "decompose",
+    "build_report_pdf",
+    "report_filename",
     "load_local_env",
     "Autocallable",
     "ReverseConvertible",
