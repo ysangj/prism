@@ -12,6 +12,29 @@ Template — copy for each new week:
 - Feedback item 2
 -->
 
+## Week of 2026-06-22
+
+**UX — high priority**
+- Restructure each result section (2–4) into two parts: a **"Key takeaway / At a
+  glance"** block (the verdict, the number, and the core points — concise and
+  well-formatted, a few bullets if warranted) and a **"Detailed analysis"** block
+  (breakdown + chart + deeper read) that is **collapsed by default**. Give it a clear
+  type scale so the elements stop competing. Section 2 currently stacks ~5
+  differently-formatted summaries of the same number with no hierarchy.
+- Make the **collapsed "Detailed analysis" toggle clearly visible** (labeled control, not
+  a subtle caret) so the charts stay discoverable.
+
+**UX — moderate**
+- Make each **section header the clear visual anchor** of its section — currently
+  "2 · Component decomposition" is visually outranked by the content beneath it.
+- Move **"Download PDF report"** out of the middle of section 2 to a consistent
+  document-level location (a results toolbar at the top, or the end of the results).
+- Trim the hero margin value to **"$2,707"** — the "(2.71% of notional)" is already shown
+  as the caption below and currently truncates ("$2,707 (2.71% of n…") at common laptop widths.
+
+**UX — polish**
+- Unify the takeaway-box color — section 2's is olive while the others are blue.
+
 ## Week of 2026-06-15
 
 **UX — high priority**
